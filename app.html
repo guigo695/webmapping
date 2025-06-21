@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Carte Leaflet multi-couches avec infos domaine_recasser</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body, #map { height: 100vh; margin: 0; padding: 0; }
+  #sidebar {
+    position: absolute;
+    top: 10px; left: 10px;
+    z-index: 1000;
+    background: white;
+    padding: 10px;
+    width: 350px;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: 0 0 8px rgba(0,0,0,0.3);
+    font-family: Arial, sans-serif;
+  }
+  #sidebar h2 { margin: 0 0 10px 0; font-size: 18px; }
+  #tabs {
+    display: flex;
+    margin-bottom: 10px;
+  }
+  #tabs button {
+    flex: 1;
+    cursor: pointer;
+    padding: 6px;
+    border: 1px solid #ccc;
+    background: #f5f5f5;
+    font-weight: bold;
+  }
+  #tabs button.active {
+    background: #ddd;
+  }
+  .list-container {
+    display: none;
+  }
+  .list-container.active {
+    display: block;
+  }
+  ul { list-style: none; padding: 0; margin: 0; max-height: 50vh; overflow-y: auto; }
+  li {
+    cursor: pointer;
+    margin-bottom: 5px;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 5px;
+  }
+  li:hover { background: #eee; }
+  .nature {
+    font-size: 0.9em;
+    color: #555;
+  }
+  #map { margin-left: 370px; }
+  select {
+    width: 100%;
+    margin-bottom: 10px;
+    padding: 4px;
+  }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <h2>Liste des entités</h2>
+  <div id="tabs">
+    <button class="active" data-tab="arrondissements">Arrondissements</button>
+    <button data-tab="localites">Localités</button>
+    <button data-tab="domaines">Domaines Recasser</button>
+    <button data-tab="reserves">Réserves</button>
+  </div>
+
+  <div id="arrondissements" class="list-container active"><ul></ul></div>
+  <div id="localites" class="list-container"><ul></ul></div>
+  <div id="domaines" class="list-container"><ul></ul></div>
+
+  <div id="reserves" class="list-container">
+    <!-- Bouton actualiser ajouté -->
+    <button id="refreshBtn" style="width:100%; margin-bottom:10px; padding:6px; background-color:#2a9d8f; color:#fff; border:none; cursor:pointer; border-radius:4px; font-weight:bold;">
+      Actualiser les réserves
+    </button>
+
+    <label for="typeReserve">Filtrer par type de réserve :</label>
+    <select id="typeReserve">
+      <option value="all">-- Tous les types --</option>
+    </select>
+    <ul id="reserve-list"></ul>
+  </div>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([6.4, 2.6], 11);
+
+const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '© OpenStreetMap'
+}).addTo(map);
+
+const carto = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+  maxZoom: 19, attribution: '© CartoDB'
+});
+
+const esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom: 19, attribution: '© Esri'
+});
+
+L.control.layers({"OpenStreetMap": osm, "CartoDB": carto, "Esri": esri}).addTo(map);
+
+// Contrôle personnalisé des couches avec cases à cocher
+const overlaysControl = L.control({position: 'topright'});
+overlaysControl.onAdd = function () {
+  const div = L.DomUtil.create('div', 'leaflet-control-layers leaflet-control');
+  div.style.background = 'white';
+  div.style.padding = '5px';
+  div.style.boxShadow = '0 0 8px rgba(0,0,0,0.3)';
+  div.style.fontSize = '14px';
+
+  div.innerHTML = `
+    <strong>Afficher/Cacher les couches :</strong><br/>
+    <label><input type="checkbox" checked id="chkArrondissement"> Arrondissements</label><br/>
+    <label><input type="checkbox" checked id="chkLocalite"> Localités</label><br/>
+    <label><input type="checkbox" checked id="chkDomaine"> Domaines Recasser</label><br/>
+    <label><input type="checkbox" checked id="chkReserve"> Réserves</label><br/>
+  `;
+
+  return div;
+};
+overlaysControl.addTo(map);
+
+let arrLayer, locLayer, domLayer, reserveLayer;
+let allReserves = [];
+
+Promise.all([
+  loadGeoJson('arrondissement.php',
+    {color: 'blue', weight: 2, fillOpacity: 0.2},
+    f => `<b>Arrondissement:</b> ${f.properties.arrond || 'N/A'}`),
+  loadGeoJson('localite.php',
+    null,
+    f => `<b>Localité:</b> ${f.properties.nom || 'N/A'}`,
+    (f, latlng) => L.circleMarker(latlng, {radius:6, fillColor:'red', color:'#800000', weight:1, fillOpacity:0.8})
+  ),
+  loadGeoJson('domaine_recasser.php',
+    {color: 'purple', weight: 2, fillOpacity: 0.3},
+    f => {
+      const p = f.properties;
+      return `<b>Domaine Recasser ID:</b> ${p.id || ''}<br>
+              <b>Code INSAE:</b> ${p.code_insae || ''}<br>
+              <b>Type Parcelle:</b> ${p.type_parce || 'N/A'}<br>
+              <b>Lotissement:</b> ${p.lotissemen || 'N/A'}<br>
+              <b>Surface SIG:</b> ${p.surf_sig || 'N/A'}<br>
+              <b>Créé par:</b> ${p.user_creat || 'N/A'} le ${p.date_creat || 'N/A'}<br>
+              <b>Modifié par:</b> ${p.user_modif || 'N/A'} le ${p.date_modif || 'N/A'}`;
+    }),
+  fetch('reserve.php').then(r => r.json())
+]).then(results => {
+  [arrLayer, locLayer, domLayer, reserveData] = results;
+
+  arrLayer.addTo(map);
+  locLayer.addTo(map);
+  domLayer.addTo(map);
+
+  fillSidebarList(arrLayer, 'arrondissements', p => p.arrond || 'ID ' + p.id);
+  fillSidebarList(locLayer, 'localites', p => p.nom || 'ID ' + p.id);
+
+  // Domaine recasser sidebar
+  const ulDom = document.querySelector('#domaines ul');
+  ulDom.innerHTML = '';
+  domLayer.eachLayer(l => {
+    const p = l.feature.properties;
+    const li = document.createElement('li');
+    li.innerHTML = `
+      <strong>ID:</strong> ${p.id || ''} - <strong>Code INSAE:</strong> ${p.code_insae || ''}<br>
+      <strong>Type Parcelle:</strong> ${p.type_parce || 'N/A'}<br>
+      <strong>Lotissement:</strong> ${p.lotissemen || 'N/A'}<br>
+      <strong>Surface SIG:</strong> ${p.surf_sig || 'N/A'}<br>
+      <small><em>Créé par ${p.user_creat || 'N/A'} le ${p.date_creat || 'N/A'}</em></small><br>
+      <small><em>Modifié par ${p.user_modif || 'N/A'} le ${p.date_modif || 'N/A'}</em></small>
+    `;
+    li.style.cursor = 'pointer';
+    li.onclick = () => {
+      map.fitBounds(l.getBounds());
+      l.openPopup();
+    };
+    ulDom.appendChild(li);
+  });
+
+  allReserves = reserveData.features;
+
+  const select = document.getElementById('typeReserve');
+  const types = [...new Set(allReserves.map(f => f.properties.type_de_pa).filter(Boolean))];
+  types.forEach(t => {
+    const option = document.createElement('option');
+    option.value = t;
+    option.textContent = t;
+    select.appendChild(option);
+  });
+
+  function updateReserveList(type) {
+    if (reserveLayer) map.removeLayer(reserveLayer);
+
+    const filtered = (type === 'all') ? allReserves : allReserves.filter(f => f.properties.type_de_pa === type);
+
+    if (filtered.length === 0) {
+      document.getElementById('reserve-list').innerHTML = '<li>Aucune réserve trouvée</li>';
+      return;
+    }
+
+    reserveLayer = L.geoJSON({type: "FeatureCollection", features: filtered}, {
+      style: { color: 'green', weight: 2, fillOpacity: 0.3 },
+      onEachFeature: (feature, layer) => {
+        const p = feature.properties;
+        let img = p.image_du_d ? `<br><img src="${p.image_du_d}" style="max-width:100px;">` : '';
+        layer.bindPopup(
+          `<strong>Réserve ID:</strong> ${p.id}<br>
+           Département: ${p.departemen}<br>
+           Commune: ${p.commune}<br>
+           Type: ${p.type_de_pa}<br>
+           Nature: ${p.nature_de_}${img}`
+        );
+      }
+    }).addTo(map);
+
+    const ul = document.getElementById('reserve-list');
+    ul.innerHTML = '';
+    filtered.forEach(f => {
+      const p = f.properties;
+      const li = document.createElement('li');
+      li.innerHTML = `<strong>ID:</strong> ${p.id} - <strong>Type:</strong> ${p.type_de_pa}<br>
+                      <span class="nature"><strong>Nature:</strong> ${p.nature_de_ || 'N/A'}</span>`;
+      li.style.cursor = 'pointer';
+      li.onclick = () => {
+        const layer = reserveLayer.getLayers().find(l => l.feature.properties.id === p.id);
+        if (layer) {
+          map.fitBounds(layer.getBounds());
+          layer.openPopup();
+        }
+      };
+      ul.appendChild(li);
+    });
+
+    map.fitBounds(reserveLayer.getBounds());
+  }
+
+  updateReserveList('all');
+  select.addEventListener('change', e => updateReserveList(e.target.value));
+
+  // Gestion cases à cocher
+  document.getElementById('chkArrondissement').addEventListener('change', e => {
+    if (e.target.checked) map.addLayer(arrLayer);
+    else map.removeLayer(arrLayer);
+    zoomOnVisibleLayers();
+  });
+  document.getElementById('chkLocalite').addEventListener('change', e => {
+    if (e.target.checked) map.addLayer(locLayer);
+    else map.removeLayer(locLayer);
+    zoomOnVisibleLayers();
+  });
+  document.getElementById('chkDomaine').addEventListener('change', e => {
+    if (e.target.checked) map.addLayer(domLayer);
+    else map.removeLayer(domLayer);
+    zoomOnVisibleLayers();
+  });
+  document.getElementById('chkReserve').addEventListener('change', e => {
+    if (e.target.checked) {
+      if (reserveLayer) map.addLayer(reserveLayer);
+      else updateReserveList(select.value);
+    } else {
+      if (reserveLayer) map.removeLayer(reserveLayer);
+    }
+    zoomOnVisibleLayers();
+  });
+
+  function zoomOnVisibleLayers() {
+    let layers = [];
+    if (map.hasLayer(arrLayer)) layers = layers.concat(arrLayer.getLayers());
+    if (map.hasLayer(locLayer)) layers = layers.concat(locLayer.getLayers());
+    if (map.hasLayer(domLayer)) layers = layers.concat(domLayer.getLayers());
+    if (map.hasLayer(reserveLayer)) layers = layers.concat(reserveLayer.getLayers());
+
+    if (layers.length > 0) {
+      const group = L.featureGroup(layers);
+      map.fitBounds(group.getBounds(), {maxZoom: 16});
+    }
+  }
+
+  // Zoom initial
+  zoomOnVisibleLayers();
+
+}).catch(e => alert("Erreur chargement couches : "+e));
+
+// --- AJOUT POUR ACTUALISATION DYNAMIQUE DES RÉSERVES ---
+
+// Fonction pour recharger la couche réserves depuis l'API
+function reloadReserveLayer() {
+  fetch('reserve.php')
+    .then(res => res.json())
+    .then(data => {
+      if (reserveLayer) map.removeLayer(reserveLayer);
+      allReserves = data.features || [];
+
+      // Met à jour la liste des types dans le filtre
+      const types = [...new Set(allReserves.map(f => f.properties.type_de_pa).filter(Boolean))];
+      const select = document.getElementById('typeReserve');
+      if (select) {
+        select.innerHTML = '<option value="all">-- Tous les types --</option>';
+        types.forEach(t => {
+          const option = document.createElement('option');
+          option.value = t;
+          option.textContent = t;
+          select.appendChild(option);
+        });
+      }
+
+      updateReserveList(select ? select.value : 'all');
+    })
+    .catch(e => alert("Erreur lors du rechargement des réserves : " + e));
+}
+
+// Événement clic sur bouton pour actualiser manuellement
+const refreshBtn = document.getElementById('refreshBtn');
+if (refreshBtn) {
+  refreshBtn.addEventListener('click', () => {
+    reloadReserveLayer();
+  });
+}
+
+// Auto actualisation toutes les 60 secondes (si couche visible)
+setInterval(() => {
+  if (map.hasLayer(reserveLayer)) {
+    reloadReserveLayer();
+  }
+}, 60000);
+
+// Fonction updateReserveList déjà définie plus haut, ne pas dupliquer !
+function loadGeoJson(url, style, popupFunc, pointStyle) {
+  return fetch(url).then(r => r.json()).then(data => {
+    return L.geoJSON(data, {
+      style: style,
+      pointToLayer: pointStyle,
+      onEachFeature: (feature, layer) => {
+        layer.bindPopup(popupFunc(feature));
+      }
+    });
+  });
+}
+
+function getListContainer(tabName) {
+  return document.querySelector(`#${tabName} ul`);
+}
+
+function fillSidebarList(layer, tabName, getLabel) {
+  const ul = getListContainer(tabName);
+  ul.innerHTML = '';
+  layer.eachLayer(l => {
+    const li = document.createElement('li');
+    li.textContent = getLabel(l.feature.properties);
+    li.onclick = () => {
+      map.fitBounds(l.getBounds());
+      l.openPopup();
+    };
+    ul.appendChild(li);
+  });
+}
+
+// Onglets sidebar
+document.querySelectorAll('#tabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#tabs button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.list-container').forEach(c => c.classList.remove('active'));
+    document.getElementById(btn.getAttribute('data-tab')).classList.add('active');
+  });
+});
+</script>
+</body>
+</html>
